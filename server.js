@@ -26,7 +26,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BACKEND_API_KEY) {
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: "warn" });
 const sockets = new Map();
-const histories = new Map(); // mémoire courte par conversation, remise à zéro au redémarrage
+const histories = new Map();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function update(userId, patch) {
@@ -37,6 +37,54 @@ async function update(userId, patch) {
 function getHistory(key) {
   if (!histories.has(key)) histories.set(key, []);
   return histories.get(key);
+}
+
+// === Enregistre un message dans Supabase (conversation + messages) ===
+async function saveMessage(userId, from, text, reply, pushName) {
+  try {
+    const contactPhone = from.split("@")[0];
+
+    const { data: existing } = await db
+      .from("conversations")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("contact_phone", contactPhone)
+      .maybeSingle();
+
+    let conversationId = existing?.id;
+
+    if (!conversationId) {
+      const { data: created } = await db
+        .from("conversations")
+        .insert({
+          user_id: userId,
+          contact_phone: contactPhone,
+          contact_name: pushName || contactPhone,
+          last_message: reply,
+          last_message_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      conversationId = created?.id;
+    } else {
+      await db
+        .from("conversations")
+        .update({
+          last_message: reply,
+          last_message_at: new Date().toISOString(),
+        })
+        .eq("id", conversationId);
+    }
+
+    if (conversationId) {
+      await db.from("messages").insert([
+        { conversation_id: conversationId, user_id: userId, role: "user", content: text },
+        { conversation_id: conversationId, user_id: userId, role: "assistant", content: reply },
+      ]);
+    }
+  } catch (e) {
+    console.error("[saveMessage]", e);
+  }
 }
 
 async function startSession(userId) {
@@ -88,7 +136,6 @@ async function startSession(userId) {
     }
   });
 
-  // Messages entrants : réponse automatique par l'IA (texte uniquement pour l'instant)
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
@@ -116,6 +163,9 @@ async function startSession(userId) {
         if (history.length > 20) history.splice(0, history.length - 20);
 
         await sock.sendMessage(from, { text: reply });
+
+        // Enregistrement dans Supabase
+        await saveMessage(userId, from, text, reply, msg.pushName);
       } catch (e) {
         console.error("[message_handler]", userId, e);
       }

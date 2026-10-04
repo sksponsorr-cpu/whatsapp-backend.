@@ -9,6 +9,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
+import { generateReply } from "./ai-reply.js";
 
 const {
   SUPABASE_URL,
@@ -25,11 +26,17 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BACKEND_API_KEY) {
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: "warn" });
 const sockets = new Map();
+const histories = new Map(); // mémoire courte par conversation, remise à zéro au redémarrage
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function update(userId, patch) {
   const { error } = await db.from("whatsapp_connections").update(patch).eq("user_id", userId);
   if (error) console.error("[db]", userId, error.message);
+}
+
+function getHistory(key) {
+  if (!histories.has(key)) histories.set(key, []);
+  return histories.get(key);
 }
 
 async function startSession(userId) {
@@ -48,7 +55,6 @@ async function startSession(userId) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
-    // Nouveau QR (renouvelé toutes les ~20 s tant qu'il n'est pas scanné)
     if (qr) {
       await update(userId, {
         status: "pending",
@@ -57,7 +63,6 @@ async function startSession(userId) {
       });
     }
 
-    // QR scanné, session ouverte
     if (connection === "open") {
       const phone = sock.user.id.split("@")[0].split(":")[0];
       await update(userId, {
@@ -70,7 +75,7 @@ async function startSession(userId) {
     }
 
     if (connection === "close") {
-      if (sockets.get(userId) !== sock) return; // session remplacée volontairement
+      if (sockets.get(userId) !== sock) return;
       sockets.delete(userId);
 
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -78,14 +83,46 @@ async function startSession(userId) {
         fs.rmSync(dir, { recursive: true, force: true });
         await update(userId, { status: "disconnected", qr_code: null, qr_updated_at: null });
       } else {
-        // Inclut le redémarrage normal imposé par WhatsApp juste après le scan
         setTimeout(() => startSession(userId).catch(console.error), 2000);
+      }
+    }
+  });
+
+  // Messages entrants : réponse automatique par l'IA (texte uniquement pour l'instant)
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+
+    for (const msg of messages) {
+      try {
+        if (msg.key.fromMe) continue;
+        const from = msg.key.remoteJid;
+        if (!from || from.endsWith("@g.us") || from === "status@broadcast") continue;
+
+        const text =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          null;
+        if (!text) continue;
+
+        await sock.readMessages([msg.key]);
+        await sock.sendPresenceUpdate("composing", from);
+
+        const history = getHistory(`${userId}:${from}`);
+        const reply = await generateReply(text, history);
+
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: reply });
+        if (history.length > 20) history.splice(0, history.length - 20);
+
+        await sock.sendMessage(from, { text: reply });
+      } catch (e) {
+        console.error("[message_handler]", userId, e);
       }
     }
   });
 }
 
-// Repart de zéro : supprime l'ancienne session et force un nouveau QR
 async function freshSession(userId) {
   const old = sockets.get(userId);
   sockets.delete(userId);
@@ -121,7 +158,6 @@ app.post("/sessions/start", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Backend WhatsApp sur :${PORT}`);
-  // Reprise des sessions existantes après un redémarrage
   if (fs.existsSync(SESSIONS_DIR)) {
     for (const id of fs.readdirSync(SESSIONS_DIR)) {
       if (UUID.test(id)) startSession(id).catch(console.error);

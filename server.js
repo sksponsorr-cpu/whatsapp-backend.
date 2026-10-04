@@ -141,7 +141,20 @@ const app = express();
 app.use(express.json());
 
 app.get("/health", (_req, res) => res.json({ ok: true, sessions: sockets.size }));
+app.post("/test-message", async (req, res) => {
+  if (!safeEqual(req.get("x-api-key"), BACKEND_API_KEY)) return res.status(401).json({ error: "unauthorized" });
+  const { message, model, system_prompt } = req.body || {};
+  if (!message || typeof message !== "string") return res.status(400).json({ error: "message_required" });
 
+  try {
+    const { generateReply } = await import("./ai-reply.js");
+    const reply = await generateReply(message, [], { model, systemPrompt: system_prompt });
+    res.json({ reply });
+  } catch (e) {
+    console.error("[test-message]", e);
+    res.status(500).json({ error: "generation_failed" });
+  }
+});
 app.post("/sessions/start", async (req, res) => {
   if (!safeEqual(req.get("x-api-key"), BACKEND_API_KEY)) return res.status(401).json({ error: "unauthorized" });
   const userId = req.body?.session_id;

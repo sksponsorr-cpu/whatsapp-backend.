@@ -25,16 +25,34 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BACKEND_API_KEY) {
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: "warn" });
-const sockets = new Map(); // key: agentId → socket
+const sockets = new Map();
 const histories = new Map();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function updateSession(agentId, patch) {
-  const { error } = await db
+  const { data: existing } = await db
     .from("whatsapp_connections")
-    .update({ ...patch, updated_at: new Date().toISOString() })
-    .eq("agent_id", agentId);
-  if (error) console.error("[db]", agentId, error.message);
+    .select("id")
+    .eq("agent_id", agentId)
+    .maybeSingle();
+
+  if (existing) {
+    const { error } = await db
+      .from("whatsapp_connections")
+      .update({ ...patch, updated_at: new Date().toISOString() })
+      .eq("agent_id", agentId);
+    if (error) console.error("[db update]", agentId, error.message);
+  } else {
+    const { error } = await db
+      .from("whatsapp_connections")
+      .insert({
+        agent_id: agentId,
+        user_id: agentId,
+        ...patch,
+        updated_at: new Date().toISOString(),
+      });
+    if (error) console.error("[db insert]", agentId, error.message);
+  }
 }
 
 function getHistory(key) {
@@ -168,7 +186,6 @@ async function startSession(agentId) {
         await sock.readMessages([msg.key]);
         await sock.sendPresenceUpdate("composing", from);
 
-        // Charge la config de l'agent à chaque message
         const cfg = await getAgentConfig(agentId);
 
         const history = getHistory(`${agentId}:${from}`);
